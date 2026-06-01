@@ -169,6 +169,7 @@ def incoming_by_owner(planets, fleets):
 def estimate_capture(source, target, already_assigned, max_speed, angular_velocity, comet_ids):
     margin = P["margin_neutral"] if target.owner == -1 else P["margin_enemy"]
     required = max(1, target.ships + margin - already_assigned)
+    required = max(1, target.ships + margin - already_assigned)
     eta = 0.0
     tx, ty = target.x, target.y
     for _ in range(4):
@@ -320,7 +321,7 @@ def load_agent(filepath):
     return mod.agent
 
 # -------------------------------------------------------------
-# EVOLUTION ENGINE CORE
+# EVOLUTION ENGINE CORE (UPGRADED WITH CO-POSITIONAL BIAS ELIMINATOR)
 # -------------------------------------------------------------
 def mutate_params(parent):
     child = {}
@@ -347,40 +348,76 @@ def evaluate_candidate(candidate_name, candidate_params, opp_v3, opp_rush, opp_t
     total_planets = 0
     total_ships = 0
     
-    # 4 games of 1v1 against bot_v3 (to test elite capability)
-    # 4 games of chaos mixed-league (to test general robustness)
-    for idx in range(num_games):
+    # Symmetrical distribution:
+    # 50% games Track 1 (1v1 vs v3 with Position Swapping)
+    # 50% games Track 2 (4-Player Chaos with Color Slot Rotation)
+    track1_games = num_games // 2
+    track2_games = num_games - track1_games
+    
+    # 1. Track 1 Symmetrical 1v1 Swaps (Must be even)
+    for idx in range(track1_games // 2):
         seed = start_seed + idx
-        env = make("orbit_wars", debug=False)
         
-        if idx < num_games // 2:
-            # Track 1: 1v1 against bot_v3
-            env.run([candidate_agent, opp_v3, "random", "random"])
+        # Symmetrical Match A: Candidate is P0 (Slot 0), v3 is P1 (Slot 1)
+        env_a = make("orbit_wars", debug=False)
+        env_a.run([candidate_agent, opp_v3, "random", "random"])
+        rewards_a = [p.get("reward", -1.0) for p in env_a.steps[-1]]
+        
+        r_a = rewards_a[0]
+        p_a = sum(1 for p in env_a.steps[-1][0]["observation"].get("planets", []) if p[1] == 0)
+        s_a = sum(p[5] for p in env_a.steps[-1][0]["observation"].get("planets", []) if p[1] == 0)
+        
+        if r_a == 1.0: wins += 1
+        total_reward += r_a
+        total_planets += p_a
+        total_ships += s_a
+        
+        # Symmetrical Match B: v3 is P0 (Slot 0), Candidate is P1 (Slot 1) (Position Swapped!)
+        env_b = make("orbit_wars", debug=False)
+        env_b.run([opp_v3, candidate_agent, "random", "random"])
+        rewards_b = [p.get("reward", -1.0) for p in env_b.steps[-1]]
+        
+        r_b = rewards_b[1]
+        p_b = sum(1 for p in env_b.steps[-1][0]["observation"].get("planets", []) if p[1] == 1)
+        s_b = sum(p[5] for p in env_b.steps[-1][0]["observation"].get("planets", []) if p[1] == 1)
+        
+        if r_b == 1.0: wins += 1
+        total_reward += r_b
+        total_planets += p_b
+        total_ships += s_b
+        
+    # 2. Track 2 Multi-Agent Chaos with Color Slot Rotation [0, 1, 2, 3]
+    for idx in range(track2_games):
+        seed = start_seed + track1_games + idx
+        env_c = make("orbit_wars", debug=False)
+        
+        slot = idx % 4
+        if slot == 0:
+            agents = [candidate_agent, opp_v3, opp_rush, opp_turtle]
+        elif slot == 1:
+            agents = [opp_v3, candidate_agent, opp_rush, opp_turtle]
+        elif slot == 2:
+            agents = [opp_v3, opp_rush, candidate_agent, opp_turtle]
         else:
-            # Track 2: Chaos 4-Player League
-            env.run([candidate_agent, opp_v3, opp_rush, opp_turtle])
+            agents = [opp_v3, opp_rush, opp_turtle, candidate_agent]
             
-        last_step = env.steps[-1]
-        p0_reward = last_step[0].get("reward", -1.0)
+        env_c.run(agents)
+        rewards_c = [p.get("reward", -1.0) for p in env_c.steps[-1]]
         
-        if p0_reward == 1.0:
-            wins += 1
-        total_reward += p0_reward
+        r_c = rewards_c[slot]
+        p_c = sum(1 for p in env_c.steps[-1][0]["observation"].get("planets", []) if p[1] == slot)
+        s_c = sum(p[5] for p in env_c.steps[-1][0]["observation"].get("planets", []) if p[1] == slot)
         
-        final_obs = last_step[0]["observation"]
-        planets = final_obs.get("planets", [])
-        p0_planets = sum(1 for p in planets if p[1] == 0)
-        p0_ships = sum(p[5] for p in planets if p[1] == 0)
-        
-        total_planets += p0_planets
-        total_ships += p0_ships
+        if r_c == 1.0: wins += 1
+        total_reward += r_c
+        total_planets += p_c
+        total_ships += s_c
 
     win_rate = (wins / num_games) * 100
     avg_reward = total_reward / num_games
     avg_planets = total_planets / num_games
     avg_ships = total_ships / num_games
     
-    # Fitness Function incorporating win rate, reward and size metrics to prevent mixing
     fitness = win_rate * 10.0 + avg_reward * 200.0 + avg_planets * 10.0 + avg_ships * 0.05
     return {
         "name": candidate_name,
@@ -393,15 +430,15 @@ def evaluate_candidate(candidate_name, candidate_params, opp_v3, opp_rush, opp_t
     }
 
 def main():
-    parser = argparse.ArgumentParser(description="Self-Play Genetic Parameter Evolution League")
+    parser = argparse.ArgumentParser(description="Strict Position-Swapped Genetic Parameter Evolution")
     parser.add_argument("--generations", type=int, default=3, help="Number of genetic search generations (default: 3)")
     parser.add_argument("--candidates-per-gen", type=int, default=3, help="Number of mutated offspring per generation (default: 3)")
     parser.add_argument("--games-per-candidate", type=int, default=8, help="Matches per candidate (Track 1 + 2 combined, default: 8)")
     args = parser.parse_args()
     
-    print("\n" + "="*65)
-    print("    *** SELF-PLAY GENETIC LEAGUE ENGINE (v3 CHAMP SPARRING) ***   ")
-    print("="*65)
+    print("\n" + "="*70)
+    print("  *** STRICT CO-POSITIONAL SWAPPING GENETIC TUNER (v3 CHAMP SPARRING) *** ")
+    print("="*70)
     
     # Load opponents
     print("[*] Warming up and loading sparring pool...")
@@ -418,7 +455,6 @@ def main():
         print(f" [FAILED] Error loading pool: {e}")
         sys.exit(1)
         
-    # Start seed parent (v3 parameters)
     parent_params = {
         "margin_neutral": 3.0,
         "margin_enemy": 6.0,
@@ -433,7 +469,7 @@ def main():
         "cheap_opening_bonus": 18.0
     }
     
-    print("\n[*] Evaluating Parent 0 (v3 Baseline)...", end="")
+    print("\n[*] Evaluating Symmetrical Parent 0 (v3 Baseline)...", end="")
     parent_metrics = evaluate_candidate(
         "v3_parent", parent_params, opp_v3, opp_rush, opp_turtle, opp_baseline, start_seed=4000, num_games=args.games_per_candidate
     )
@@ -445,12 +481,11 @@ def main():
     
     # Generation Loop
     for g in range(1, args.generations + 1):
-        print("\n" + "-"*65)
-        print(f"=== GENERATION {g} / {args.generations} (Evolving from best parent) ===")
-        print("-"*65)
+        print("\n" + "-"*70)
+        print(f"=== GENERATION {g} / {args.generations} (Symmetrical Co-Position Evolution) ===")
+        print("-"*70)
         
         candidates = []
-        # Always evaluate the parent to maintain exact seed alignment and avoid stochastic drift
         candidates.append(current_parent)
         
         for c in range(1, args.candidates_per_gen + 1):
@@ -467,7 +502,6 @@ def main():
             print(f"    └─ WinRate: {res['win_rate']:.1f}%, AvgReward: {res['reward']:+.3f}, Fitness: {res['fitness']:.1f}")
             candidates.append(res)
             
-        # Select best candidate of this generation
         candidates.sort(key=lambda x: -x["fitness"])
         best_candidate = candidates[0]
         
@@ -477,31 +511,30 @@ def main():
             current_parent = best_candidate
             history.append(current_parent)
         else:
-            print("\n[EVOLUTION STAGNATION] Parent remains the dominant strategist.")
+            print("\n[EVOLUTION STAGNATION] Symmetrical Parent remains the dominant strategist.")
             
     # -------------------------------------------------------------
-    # VALIDATION / VERIFICATION PHASE (ANTI-OVERFITTING)
+    # VALIDATION / VERIFICATION PHASE (ANTI-OVERFITTING SHIELD)
     # -------------------------------------------------------------
-    print("\n" + "="*65)
-    print("      *** VERIFICATION PHASE (ANTI-OVERFITTING SHIELD) ***      ")
-    print("="*65)
-    print("[*] Simulating final champion on UNKNOWN SEEDS against v3...")
+    print("\n" + "="*70)
+    print("   *** SYMMETRICAL VALIDATION PHASE (ANTI-OVERFITTING SHIELD) ***   ")
+    print("="*70)
+    print("[*] Simulating final champion on UNKNOWN SEEDS with Position Swapping...")
     
-    # 10 matches on unseen seeds [8000-8009]
     validation_metrics = evaluate_candidate(
-        "validation_champion", current_parent["params"], opp_v3, opp_rush, opp_turtle, opp_baseline, start_seed=8000, num_games=10
+        "validation_champion", current_parent["params"], opp_v3, opp_rush, opp_turtle, opp_baseline, start_seed=8000, num_games=12
     )
     
-    print("\n=== FINAL VALIDATION RESULTS (vs v3 Champion on Unseen Seeds):")
-    print(f"    └─ Final Win Rate vs. v3    : {validation_metrics['win_rate']:.1f}%")
-    print(f"    └─ Avg Leaderboard Reward   : {validation_metrics['reward']:+.3f}")
-    print(f"    └─ Avg Final Planet Count   : {validation_metrics['planets']:.1f}")
-    print(f"    └─ Avg Final Garrison Fleet : {validation_metrics['ships']:.1f}")
+    print("\n=== FINAL VALIDATION RESULTS (vs v3 on Unseen Seeds under Position Swapping):")
+    print(f"    └─ Symmetrical Win Rate vs. v3  : {validation_metrics['win_rate']:.1f}%")
+    print(f"    └─ Symmetrical Avg Reward       : {validation_metrics['reward']:+.3f}")
+    print(f"    └─ Symmetrical Avg Planets      : {validation_metrics['planets']:.1f}")
+    print(f"    └─ Symmetrical Avg Fleet Size   : {validation_metrics['ships']:.1f}")
     
     print("\n=== OPTIMIZED CHAMPION SUPER-PARAMETERS:")
     for k, v in current_parent["params"].items():
         print(f"    -> {k:<24} : {v}")
-    print("="*65 + "\n")
+    print("="*70 + "\n")
 
 if __name__ == "__main__":
     main()
