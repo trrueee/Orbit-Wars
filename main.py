@@ -197,13 +197,13 @@ def target_score(source, target, required, eta, tx, ty, my_player, comet_ids):
 
     # Expansion first: production is king, but expensive/far planets should wait.
     if target.owner == -1:
-        score = (prod * 150.0) / (d + 12.0) + (prod * 55.0) / (required + 6.0)
+        score = (prod * 160.0) / (d + 12.0) + (prod * 70.0) / (required + 6.0)
         if required <= 12:
             score += 12.0
     else:
         # Enemy captures matter, but don't suicide into distant fortified planets.
-        score = (prod * 115.0) / (d + 18.0) + (prod * 40.0) / (required + 10.0)
-        score += 10.0  # conquest swing bonus
+        score = (prod * 120.0) / (d + 18.0) + (prod * 45.0) / (required + 10.0)
+        score += 12.0  # conquest swing bonus
 
     # Comets are temporary and production 1; only take them when very convenient.
     if target.id in comet_ids:
@@ -342,8 +342,8 @@ def agent(obs, config=None):
                 score *= 0.72
 
             # Very cheap neutrals are excellent opening snowball targets.
-            if target.owner == -1 and target.ships <= 12 and dist_xy(source.x, source.y, tx, ty) < 35:
-                score += 18.0
+            if target.owner == -1 and target.ships <= 12 and dist_xy(source.x, source.y, tx, ty) < 38:
+                score += 28.0
 
             if best is None or score > best[0]:
                 best = (score, target, required, eta, tx, ty)
