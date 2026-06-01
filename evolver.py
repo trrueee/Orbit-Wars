@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import math
 import logging
+import random
 
 # Silence loggers
 logging.disable(logging.CRITICAL)
@@ -11,7 +12,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 from kaggle_environments import make
 
-# Add current path to sys.path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 # -------------------------------------------------------------
@@ -32,7 +32,7 @@ P = {
 }
 
 # -------------------------------------------------------------
-# MASTER TOURNAMENT BOT ABSTRACTED IMPLEMENTATION
+# TOURNAMENT BOT ABSTRACTED IMPLEMENTATION
 # -------------------------------------------------------------
 CENTER_X = 50.0
 CENTER_Y = 50.0
@@ -319,198 +319,189 @@ def load_agent(filepath):
     spec.loader.exec_module(mod)
     return mod.agent
 
+# -------------------------------------------------------------
+# EVOLUTION ENGINE CORE
+# -------------------------------------------------------------
+def mutate_params(parent):
+    child = {}
+    for k, v in parent.items():
+        if k in ["neutral_dist_mult", "neutral_req_mult", "enemy_dist_mult", "enemy_req_mult", "enemy_conquest_bonus", "cheap_opening_bonus"]:
+            noise = random.gauss(0, 10.0)
+            child[k] = round(clamp(v + noise, 30.0, 240.0), 1)
+        elif k in ["cheap_opening_dist"]:
+            noise = random.gauss(0, 2.5)
+            child[k] = round(clamp(v + noise, 20.0, 48.0), 1)
+        elif k in ["margin_neutral", "margin_enemy", "garrison_base", "garrison_prod_mult"]:
+            noise = random.gauss(0, 0.8)
+            child[k] = round(clamp(v + noise, 1.0, 10.0), 1)
+        else:
+            child[k] = v
+    return child
+
+def evaluate_candidate(candidate_name, candidate_params, opp_v3, opp_rush, opp_turtle, opp_baseline, start_seed=1000, num_games=8):
+    global P
+    P.update(candidate_params)
+    
+    wins = 0
+    total_reward = 0.0
+    total_planets = 0
+    total_ships = 0
+    
+    # 4 games of 1v1 against bot_v3 (to test elite capability)
+    # 4 games of chaos mixed-league (to test general robustness)
+    for idx in range(num_games):
+        seed = start_seed + idx
+        env = make("orbit_wars", debug=False)
+        
+        if idx < num_games // 2:
+            # Track 1: 1v1 against bot_v3
+            env.run([candidate_agent, opp_v3, "random", "random"])
+        else:
+            # Track 2: Chaos 4-Player League
+            env.run([candidate_agent, opp_v3, opp_rush, opp_turtle])
+            
+        last_step = env.steps[-1]
+        p0_reward = last_step[0].get("reward", -1.0)
+        
+        if p0_reward == 1.0:
+            wins += 1
+        total_reward += p0_reward
+        
+        final_obs = last_step[0]["observation"]
+        planets = final_obs.get("planets", [])
+        p0_planets = sum(1 for p in planets if p[1] == 0)
+        p0_ships = sum(p[5] for p in planets if p[1] == 0)
+        
+        total_planets += p0_planets
+        total_ships += p0_ships
+
+    win_rate = (wins / num_games) * 100
+    avg_reward = total_reward / num_games
+    avg_planets = total_planets / num_games
+    avg_ships = total_ships / num_games
+    
+    # Fitness Function incorporating win rate, reward and size metrics to prevent mixing
+    fitness = win_rate * 10.0 + avg_reward * 200.0 + avg_planets * 10.0 + avg_ships * 0.05
+    return {
+        "name": candidate_name,
+        "win_rate": win_rate,
+        "reward": avg_reward,
+        "planets": avg_planets,
+        "ships": avg_ships,
+        "fitness": fitness,
+        "params": candidate_params.copy()
+    }
+
 def main():
-    parser = argparse.ArgumentParser(description="Orbit Wars Mutation Evolution League Engine")
-    parser.add_argument("--games-per-candidate", type=int, default=15, help="Number of games to run per variant (default: 15)")
+    parser = argparse.ArgumentParser(description="Self-Play Genetic Parameter Evolution League")
+    parser.add_argument("--generations", type=int, default=3, help="Number of genetic search generations (default: 3)")
+    parser.add_argument("--candidates-per-gen", type=int, default=3, help="Number of mutated offspring per generation (default: 3)")
+    parser.add_argument("--games-per-candidate", type=int, default=8, help="Matches per candidate (Track 1 + 2 combined, default: 8)")
     args = parser.parse_args()
     
-    print("\n" + "="*60)
-    print("     *** ORBIT WARS STRATEGY MUTATION & SELECTION ENGINE ***    ")
-    print("="*60)
+    print("\n" + "="*65)
+    print("    *** SELF-PLAY GENETIC LEAGUE ENGINE (v3 CHAMP SPARRING) ***   ")
+    print("="*65)
     
-    # 1. Warm up environment
-    print("[*] Pre-warming Orbit Wars environment...", end="")
+    # Load opponents
+    print("[*] Warming up and loading sparring pool...")
     try:
-        warmup_env = make("orbit_wars", debug=False)
-        print(" [OK]")
+        opp_v3 = load_agent("opponents/bot_v3.py")
+        print("    -> [OK] bot_v3.py (625-Point Master Sparrer - Baseline)")
+        opp_rush = load_agent("opponents/bot_rush.py")
+        print("    -> [OK] bot_rush.py (Rush Sparrer)")
+        opp_turtle = load_agent("opponents/bot_turtle.py")
+        print("    -> [OK] bot_turtle.py (Turtle Sparrer)")
+        opp_baseline = load_agent("opponents/bot_v1.py")
+        print("    -> [OK] bot_v1.py (Baseline Heuristics)")
     except Exception as e:
-        print(f" [FAILED]\nError: {e}")
+        print(f" [FAILED] Error loading pool: {e}")
         sys.exit(1)
         
-    # 2. Load Sparring Partners
-    print("[*] Assembling Mixed Sparring Pool...")
-    try:
-        agent_rush = load_agent("opponents/bot_rush.py")
-        print("    -> [OK] bot_rush.py (Hyper-Aggressive Sparrer)")
-        agent_turtle = load_agent("opponents/bot_turtle.py")
-        print("    -> [OK] bot_turtle.py (Defense Turtle Sparrer)")
-        agent_baseline = load_agent("opponents/bot_v1.py")
-        print("    -> [OK] bot_v1.py (Standard Heuristic Sparrer)")
-    except Exception as e:
-        print(f" [FAILED]\nError loading sparring pool: {e}")
-        sys.exit(1)
-        
-    # 3. Define Variants
-    variants = {
-        "Base (Master Bot)": {
-            "margin_neutral": 3.0,
-            "margin_enemy": 6.0,
-            "neutral_dist_mult": 150.0,
-            "neutral_req_mult": 55.0,
-            "enemy_dist_mult": 115.0,
-            "enemy_req_mult": 40.0,
-            "enemy_conquest_bonus": 10.0,
-            "garrison_base": 5.0,
-            "garrison_prod_mult": 2.0,
-            "cheap_opening_dist": 35.0,
-            "cheap_opening_bonus": 18.0
-        },
-        "Variant A (Speed Rush)": {
-            "margin_neutral": 1.0,
-            "margin_enemy": 3.0,
-            "neutral_dist_mult": 180.0,
-            "neutral_req_mult": 55.0,
-            "enemy_dist_mult": 115.0,
-            "enemy_req_mult": 40.0,
-            "enemy_conquest_bonus": 5.0,
-            "garrison_base": 3.0,
-            "garrison_prod_mult": 1.0,
-            "cheap_opening_dist": 40.0,
-            "cheap_opening_bonus": 25.0
-        },
-        "Variant B (Iron Defense)": {
-            "margin_neutral": 5.0,
-            "margin_enemy": 8.0,
-            "neutral_dist_mult": 130.0,
-            "neutral_req_mult": 45.0,
-            "enemy_dist_mult": 100.0,
-            "enemy_req_mult": 30.0,
-            "enemy_conquest_bonus": 15.0,
-            "garrison_base": 8.0,
-            "garrison_prod_mult": 3.0,
-            "cheap_opening_dist": 30.0,
-            "cheap_opening_bonus": 12.0
-        },
-        "Variant C (Sniper Conquest)": {
-            "margin_neutral": 3.0,
-            "margin_enemy": 7.0,
-            "neutral_dist_mult": 110.0,
-            "neutral_req_mult": 40.0,
-            "enemy_dist_mult": 160.0,
-            "enemy_req_mult": 65.0,
-            "enemy_conquest_bonus": 20.0,
-            "garrison_base": 5.0,
-            "garrison_prod_mult": 2.0,
-            "cheap_opening_dist": 35.0,
-            "cheap_opening_bonus": 10.0
-        },
-        "Variant D (Balanced Snowball)": {
-            "margin_neutral": 3.0,
-            "margin_enemy": 6.0,
-            "neutral_dist_mult": 160.0,
-            "neutral_req_mult": 70.0,
-            "enemy_dist_mult": 120.0,
-            "enemy_req_mult": 45.0,
-            "enemy_conquest_bonus": 12.0,
-            "garrison_base": 5.0,
-            "garrison_prod_mult": 2.0,
-            "cheap_opening_dist": 38.0,
-            "cheap_opening_bonus": 28.0
-        }
+    # Start seed parent (v3 parameters)
+    parent_params = {
+        "margin_neutral": 3.0,
+        "margin_enemy": 6.0,
+        "neutral_dist_mult": 150.0,
+        "neutral_req_mult": 55.0,
+        "enemy_dist_mult": 115.0,
+        "enemy_req_mult": 40.0,
+        "enemy_conquest_bonus": 10.0,
+        "garrison_base": 5.0,
+        "garrison_prod_mult": 2.0,
+        "cheap_opening_dist": 35.0,
+        "cheap_opening_bonus": 18.0
     }
     
-    print(f"\n[LEAGUE] Initiating mixed-league tournament across {args.games_per_candidate} seeds.")
-    print("Opponent Slots: Slot 0 (Candidate), Slot 1 (Rush), Slot 2 (Turtle), Slot 3 (Baseline)")
-    print("-"*60)
+    print("\n[*] Evaluating Parent 0 (v3 Baseline)...", end="")
+    parent_metrics = evaluate_candidate(
+        "v3_parent", parent_params, opp_v3, opp_rush, opp_turtle, opp_baseline, start_seed=4000, num_games=args.games_per_candidate
+    )
+    print(" [OK]")
+    print(f"    -> WinRate: {parent_metrics['win_rate']:.1f}%, AvgReward: {parent_metrics['reward']:+.3f}, Fitness: {parent_metrics['fitness']:.1f}")
     
-    leaderboard = []
+    current_parent = parent_metrics
+    history = [current_parent]
     
-    for v_name, v_params in variants.items():
-        print(f"\nEvaluating: {v_name}...")
+    # Generation Loop
+    for g in range(1, args.generations + 1):
+        print("\n" + "-"*65)
+        print(f"=== GENERATION {g} / {args.generations} (Evolving from best parent) ===")
+        print("-"*65)
         
-        # Load parameters into global dictionary
-        global P
-        P.update(v_params)
+        candidates = []
+        # Always evaluate the parent to maintain exact seed alignment and avoid stochastic drift
+        candidates.append(current_parent)
         
-        wins = 0
-        total_reward = 0.0
-        total_planets = 0
-        total_ships = 0
-        total_first_cap = 0
-        
-        for idx in range(args.games_per_candidate):
-            seed = 2000 + idx
-            env = make("orbit_wars", debug=False)
-            
-            # Match layout: Candidate vs. Rush vs. Turtle vs. Baseline Heuristics
-            env.run([candidate_agent, agent_rush, agent_turtle, agent_baseline])
-            
-            last_step = env.steps[-1]
-            p0_reward = last_step[0].get("reward", -1.0)
-            
-            # Aggregate stats
-            if p0_reward == 1.0:
-                wins += 1
-            total_reward += p0_reward
-            
-            final_obs = last_step[0]["observation"]
-            planets = final_obs.get("planets", [])
-            p0_planets = sum(1 for p in planets if p[1] == 0)
-            p0_ships = sum(p[5] for p in planets if p[1] == 0)
-            
-            total_planets += p0_planets
-            total_ships += p0_ships
-            
-            # Find first capture turn
-            first_cap = len(env.steps)
-            for turn, step in enumerate(env.steps):
-                owned = sum(1 for p in step[0]["observation"].get("planets", []) if p[1] == 0)
-                if owned >= 2:
-                    first_cap = turn
-                    break
-            total_first_cap += first_cap
-            
-            sys.stdout.write(f"\r  └─ Match progress: [{idx+1}/{args.games_per_candidate}] simulated...")
+        for c in range(1, args.candidates_per_gen + 1):
+            c_name = f"Gen{g}_Child{c}"
+            c_params = mutate_params(current_parent["params"])
+            print(f"[*] Evaluating candidate {c_name}...", end="")
             sys.stdout.flush()
             
-        win_rate = (wins / args.games_per_candidate) * 100
-        avg_rew = total_reward / args.games_per_candidate
-        avg_planets = total_planets / args.games_per_candidate
-        avg_ships = total_ships / args.games_per_candidate
-        avg_cap = total_first_cap / args.games_per_candidate
+            res = evaluate_candidate(
+                c_name, c_params, opp_v3, opp_rush, opp_turtle, opp_baseline, start_seed=4000+g*100, num_games=args.games_per_candidate
+            )
+            print(" [OK]")
+            print(f"    ├─ Params: CheapOpen(dist={c_params['cheap_opening_dist']}, bonus={c_params['cheap_opening_bonus']}), Garrison({c_params['garrison_base']}+{c_params['garrison_prod_mult']}*P)")
+            print(f"    └─ WinRate: {res['win_rate']:.1f}%, AvgReward: {res['reward']:+.3f}, Fitness: {res['fitness']:.1f}")
+            candidates.append(res)
+            
+        # Select best candidate of this generation
+        candidates.sort(key=lambda x: -x["fitness"])
+        best_candidate = candidates[0]
         
-        leaderboard.append({
-            "name": v_name,
-            "win_rate": win_rate,
-            "reward": avg_rew,
-            "planets": avg_planets,
-            "ships": avg_ships,
-            "first_cap": avg_cap,
-            "params": v_params.copy()
-        })
-        
-        print(f"\n  └─ Summary: Win={win_rate:.1f}%, Reward={avg_rew:+.3f}, Planets={avg_planets:.1f}, Ships={avg_ships:.0f}, RushTurn={avg_cap:.1f}")
-        
-    # Sort leaderboard by Win Rate then Average Reward
-    leaderboard.sort(key=lambda x: (-x["win_rate"], -x["reward"]))
+        if best_candidate["fitness"] > current_parent["fitness"]:
+            print(f"\n[EVOLUTION SUCCESS] Candidate '{best_candidate['name']}' defeated the parent!")
+            print(f"    └─ Fitness Improvement: {current_parent['fitness']:.1f} -> {best_candidate['fitness']:.1f}")
+            current_parent = best_candidate
+            history.append(current_parent)
+        else:
+            print("\n[EVOLUTION STAGNATION] Parent remains the dominant strategist.")
+            
+    # -------------------------------------------------------------
+    # VALIDATION / VERIFICATION PHASE (ANTI-OVERFITTING)
+    # -------------------------------------------------------------
+    print("\n" + "="*65)
+    print("      *** VERIFICATION PHASE (ANTI-OVERFITTING SHIELD) ***      ")
+    print("="*65)
+    print("[*] Simulating final champion on UNKNOWN SEEDS against v3...")
     
-    print("\n" + "="*60)
-    print("      *** LEAGUE EVOLUTION FINAL STANDINGS ***      ")
-    print("="*60)
-    print(f"{'Rank':<4} | {'Candidate Name':<28} | {'Win Rate':<8} | {'Avg Reward':<10} | {'First Cap':<9}")
-    print("-"*60)
-    for rank, cand in enumerate(leaderboard):
-        print(f"#{rank+1:<3} | {cand['name']:<28} | {cand['win_rate']:>7.1f}% | {cand['reward']:>+9.3f}  | {cand['first_cap']:>8.1f}")
-    print("="*60)
+    # 10 matches on unseen seeds [8000-8009]
+    validation_metrics = evaluate_candidate(
+        "validation_champion", current_parent["params"], opp_v3, opp_rush, opp_turtle, opp_baseline, start_seed=8000, num_games=10
+    )
     
-    winner = leaderboard[0]
-    print(f"\nCONGRATULATIONS: '{winner['name']}' is crowned the Leader!")
-    print(f"   Win Rate: {winner['win_rate']:.1f}%")
-    print(f"   Average Leaderboard Reward: {winner['reward']:+.3f}")
-    print("   Recommended Hyperparameters:")
-    for k, v in winner["params"].items():
-        print(f"     -> {k:<22} : {v}")
-    print("="*60 + "\n")
+    print("\n=== FINAL VALIDATION RESULTS (vs v3 Champion on Unseen Seeds):")
+    print(f"    └─ Final Win Rate vs. v3    : {validation_metrics['win_rate']:.1f}%")
+    print(f"    └─ Avg Leaderboard Reward   : {validation_metrics['reward']:+.3f}")
+    print(f"    └─ Avg Final Planet Count   : {validation_metrics['planets']:.1f}")
+    print(f"    └─ Avg Final Garrison Fleet : {validation_metrics['ships']:.1f}")
+    
+    print("\n=== OPTIMIZED CHAMPION SUPER-PARAMETERS:")
+    for k, v in current_parent["params"].items():
+        print(f"    -> {k:<24} : {v}")
+    print("="*65 + "\n")
 
 if __name__ == "__main__":
     main()
